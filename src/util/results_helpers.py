@@ -16,6 +16,18 @@ parquet_schema = pa.schema(
 )
 
 
+def parquet_schema_for_embedding(embedding_size: int):
+    return pa.schema(
+        [
+            ("file_path", pa.string()),
+            ("histogram", pa.list_(pa.uint8(), 96)),
+            ("embedding", pa.list_(pa.float32(), embedding_size)),
+            ("grid_x", pa.uint8()),
+            ("grid_y", pa.uint8()),
+        ]
+    )
+
+
 def connect_to_db():
     print("connect to db")
     conn = psycopg2.connect(

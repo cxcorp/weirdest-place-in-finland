@@ -8,6 +8,7 @@ from torch import nn
 from torch.types import Device, Tensor
 from torchvision import models, tv_tensors
 from torchvision.transforms import v2
+from torchvision.models import feature_extraction
 import numpy as np
 from PIL import Image
 from multiprocessing import Pool
@@ -41,6 +42,18 @@ def load_resnet(device: Device):
     embedding_extractor = nn.Sequential(
         # remove classification layer to just get the 2048 embedding
         *list(model.children())[:-1]
+    )
+    embedding_extractor.to(device)
+
+    return embedding_extractor
+
+
+def load_maxvit(device: Device):
+    model = models.maxvit_t(weights=models.MaxVit_T_Weights.IMAGENET1K_V1)
+    # skip classification layer to just get the 512 embedding
+    return_nodes = {"classifier.4": "embedding"}
+    embedding_extractor = feature_extraction.create_feature_extractor(
+        model, return_nodes=return_nodes
     )
     embedding_extractor.to(device)
 
@@ -104,7 +117,7 @@ def basename_no_ext(p: str) -> str:
 
 def run_pipeline(input_file_paths: List[str], batch_size_resnet: int = 12 * 12):
     resnet_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    embedding_extractor = load_resnet(resnet_device)
+    embedding_extractor = load_maxvit(resnet_device)
 
     # with Pool(8) as mp_pool:
     #     images_iterator = mp_pool.imap_unordered(
@@ -134,11 +147,13 @@ def run_pipeline(input_file_paths: List[str], batch_size_resnet: int = 12 * 12):
             histograms = calculate_histograms(batch)
             # resnet presets transforms: to normalized floats
             batch = transforms(batch)
-            embeddings = embedding_extractor(batch)
+            embeddings = embedding_extractor(batch)["embedding"]
 
         histograms = histograms.cpu().numpy()
-        # (BATCH_SIZE, 2048, 1, 1) -> (BATCH_SIZE, 2048)
-        all_embeddings = np.squeeze(embeddings.cpu().numpy(), axis=(2, 3))
+        # (BATCH_SIZE, 512, 1, 1) -> (BATCH_SIZE, 512)
+        #all_embeddings = np.squeeze(embeddings.cpu().numpy(), axis=(2, 3))
+        all_embeddings = embeddings.cpu().numpy()
+        assert all_embeddings.shape == (batch_size, 512)
         grid_points = [({"x": i % 12, "y": i // 12}) for i in range(batch_size)]
 
         pbar.set_description("Database")
