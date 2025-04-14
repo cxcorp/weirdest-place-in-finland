@@ -42,7 +42,7 @@ import os
 from os import path
 from multiprocessing import Pool
 import cv2
-from PIL import Image
+import numpy as np
 
 from osgeo import gdal
 from tqdm import tqdm
@@ -66,21 +66,24 @@ def read_image(path: str):
     return cv2.cvtColor(buf, cv2.COLOR_RGB2BGR)
 
 
-def process_image(source_path: str, dest_path: str):
-    buf = read_image(source_path)
-
-    os.makedirs(dest_path, exist_ok=True)
-
+def split_image_to_tiles(buf: np.ndarray, image_prefix: str, dest_path: str):
     for y in range(12):
         for x in range(12):
             y_offset = y * 244
             x_offset = x * 244
             tile = buf[y_offset : y_offset + 244, x_offset : x_offset + 244, :]
 
-            output_file = f"{basename_no_ext(source_path)}_y{y}_x{x}.jpg"
+            output_file = f"{image_prefix}_y{y}_x{x}.jpg"
             cv2.imwrite(
                 path.join(dest_path, output_file), tile, [cv2.IMWRITE_JPEG_QUALITY, 100]
             )
+
+
+def process_image(source_path: str, dest_path: str):
+    buf = read_image(source_path)
+
+    os.makedirs(dest_path, exist_ok=True)
+    split_image_to_tiles(buf, basename_no_ext(source_path), dest_path)
 
 
 def main():
