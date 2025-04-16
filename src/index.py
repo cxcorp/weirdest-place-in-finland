@@ -54,7 +54,7 @@ def read_already_processed_file_paths(parquets_path: str) -> set[str]:
     return already_processed
 
 
-run_id: int = 1
+run_id: int = 2
 parquest_path = ".\\parquets\\maxvit"
 
 
@@ -64,12 +64,12 @@ def main():
     print(f"Preparing to process {len(input_file_paths)} files")
 
     os.makedirs(parquest_path, exist_ok=True)
-    already_processed_file_paths = read_already_processed_file_paths(parquest_path)
+    # already_processed_file_paths = read_already_processed_file_paths(parquest_path)
 
-    input_file_paths = [
-        p for p in input_file_paths if p not in already_processed_file_paths
-    ]
-    print(f"-> {len(input_file_paths)} files after removing already processed")
+    # input_file_paths = [
+    #     p for p in input_file_paths if p not in already_processed_file_paths
+    # ]
+    # print(f"-> {len(input_file_paths)} files after removing already processed")
 
     # conn = connect_to_db()
 
@@ -146,8 +146,8 @@ def main():
                         label,
                         histogram.flatten(),
                         embedding,
-                        point[0],
-                        point[1],
+                        point["x"],
+                        point["y"],
                     )
                     for label, batch in chunk
                     for point, embedding, histogram in batch

@@ -116,7 +116,7 @@ def run_pipeline(input_file_paths: List[str], batch_size_resnet: int = 12 * 12):
         (read_image(path, resnet_device), path) for path in input_file_paths
     )
 
-    has_nodata = NoDataFilter(threshold=48)
+    # has_nodata = NoDataFilter(threshold=48)
 
     pbar = tqdm(total=len(input_file_paths))
     for image, path in images_iterator:
@@ -129,26 +129,10 @@ def run_pipeline(input_file_paths: List[str], batch_size_resnet: int = 12 * 12):
             -1, 3, 224, 224
         )  # (144, 3, 224, 224)
 
-        # (x,y)[]
-        grid_points = np.array([(i % 12, i // 12) for i in range(batch.shape[0])])
-
-        # run nodata detection
-        nodata_batch = batch.cpu().numpy()  # copy to cpu
-        # (B, C, H, W) -> (B, H, W, C) for nodata filter
-        nodata_batch = nodata_batch.transpose(0, 2, 3, 1)
-
-        tile_is_nodata = np.array([has_nodata(img) for img in nodata_batch], dtype=bool)
-        valid_indices = np.where(~tile_is_nodata)[0]
-
-        if valid_indices.shape[0] == 0:
-            tqdm.write(f"No valid tiles in {path}")
-            # no tile from this image was valid
-            pbar.update(1)
-            continue
+        batch_size = batch.shape[0]
 
         # calculate all embeddings for this batch
         with torch.no_grad():
-            batch = batch.to("cuda")[valid_indices]  # skip filtered tiles
             histograms = calculate_histograms(batch)
             # resnet presets transforms: to normalized floats
             batch = transforms(batch)
@@ -157,8 +141,10 @@ def run_pipeline(input_file_paths: List[str], batch_size_resnet: int = 12 * 12):
         histograms = histograms.cpu().numpy()
         # (BATCH_SIZE, 512, 1, 1) -> (BATCH_SIZE, 512)
         # all_embeddings = np.squeeze(embeddings.cpu().numpy(), axis=(2, 3))
+
         all_embeddings = embeddings.cpu().numpy()
-        grid_points = grid_points[valid_indices]
+        assert all_embeddings.shape == (batch_size, 512)
+        grid_points = [({"x": i % 12, "y": i // 12}) for i in range(batch_size)]
 
         pbar.set_description("Database")
         yield path, list(zip(grid_points, all_embeddings, histograms))

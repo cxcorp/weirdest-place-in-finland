@@ -146,46 +146,6 @@ def read_from_parquet(run_id: int):
     return read_run_results_from_parquet(f"./run_{run_id}.parquet")
 
 
-def read_from_parquet_dataset(parquets_path: str):
-    dataset = ds.dataset(parquets_path, format="parquet")
-    rowcount: int = dataset.count_rows()
-
-    file_paths: list[str] = list()
-    histograms = np.empty((rowcount, 96), dtype=np.uint8)
-    embeddings = np.empty((rowcount, EMBEDDING_SIZE), dtype=np.float32)
-    grid_x = np.empty((rowcount,), dtype=np.uint8)
-    grid_y = np.empty((rowcount,), dtype=np.uint8)
-
-    i = 0
-    pbar = tqdm(total=rowcount, desc="Reading parquets")
-    for batch in dataset.to_batches():
-        file_paths.extend(batch["file_path"].to_pylist())
-        start_idx = i
-        end_idx = i + batch.num_rows
-        histograms[start_idx:end_idx] = np.stack(
-            batch["histogram"].to_numpy(zero_copy_only=False)
-        )
-        embeddings[start_idx:end_idx] = np.stack(
-            batch["embedding"].to_numpy(zero_copy_only=False)
-        )
-        grid_x[start_idx:end_idx] = np.stack(
-            batch["grid_x"].to_numpy(zero_copy_only=False)
-        )
-        grid_y[start_idx:end_idx] = np.stack(
-            batch["grid_y"].to_numpy(zero_copy_only=False)
-        )
-
-        i += batch.num_rows
-        pbar.update(batch.num_rows)
-
-    pbar.close()
-
-    gridpoints = np.stack((grid_x, grid_y), axis=1)
-
-    print(f"Read {histograms.shape[0]} rows from parquet")
-    return file_paths, histograms, embeddings, gridpoints
-
-
 class IgnoredTiles:
     def __init__(self, ignored_tiles_file_path: str):
         # for longer strides than 255, need to use a larger datatype below at convolutions
@@ -218,6 +178,66 @@ class IgnoredTiles:
         return ignored
 
 
+def read_from_parquet_dataset(parquets_path: str):
+    dataset = ds.dataset(parquets_path, format="parquet")
+    rowcount: int = dataset.count_rows()
+
+    file_paths: list[str] = list()
+    histograms = np.empty((rowcount, 96), dtype=np.uint8)
+    embeddings = np.empty((rowcount, EMBEDDING_SIZE), dtype=np.float32)
+    grid_x = np.empty((rowcount,), dtype=np.uint8)
+    grid_y = np.empty((rowcount,), dtype=np.uint8)
+
+    i = 0
+    pbar = tqdm(total=rowcount, desc="Reading parquets")
+    for batch in dataset.to_batches():
+        batch_embeddings = np.stack(batch["embedding"].to_numpy(zero_copy_only=False))
+
+        # filter out NaN embeddings
+        non_nan_indices = np.argwhere(
+            ~np.any(np.isnan(batch_embeddings), axis=1)
+        ).flatten()
+
+        num_valid_rows = non_nan_indices.shape[0]
+
+        start_idx = i
+        end_idx = i + num_valid_rows
+
+        embeddings[start_idx:end_idx] = batch_embeddings[non_nan_indices]
+        histograms[start_idx:end_idx] = np.stack(
+            batch["histogram"].to_numpy(zero_copy_only=False)
+        )[non_nan_indices]
+        grid_x[start_idx:end_idx] = np.stack(
+            batch["grid_x"].to_numpy(zero_copy_only=False)
+        )[non_nan_indices]
+        grid_y[start_idx:end_idx] = np.stack(
+            batch["grid_y"].to_numpy(zero_copy_only=False)
+        )[non_nan_indices]
+
+        batch_file_paths = batch["file_path"].to_pylist()
+
+        file_paths.extend([batch_file_paths[i] for i in non_nan_indices])
+
+        i += num_valid_rows
+        pbar.update(num_valid_rows)
+
+    pbar.close()
+
+    # Shrink the arrays to fit the filtered rows
+    # refcheck=True (the default) will cause an error here if debugger is attached
+    histograms.resize((i, histograms.shape[1]))
+    embeddings.resize((i, embeddings.shape[1]))
+    grid_x.resize((i,))
+    grid_y.resize((i,))
+
+    gridpoints = np.stack((grid_x, grid_y), axis=1)
+
+    assert embeddings.shape[0] == i
+
+    print(f"Read {i} rows from parquet (filtered out {rowcount-i})")
+    return file_paths, histograms, embeddings, gridpoints
+
+
 def main():
     print("read")
     start_time = time.perf_counter()
@@ -244,23 +264,23 @@ def main():
     )
 
     file_paths = [file_paths[i] for i in valid_indices]
-    histograms = histograms[valid_indices]
-    embeddings = embeddings[valid_indices]
-    gridpoints = gridpoints[valid_indices]
+    valid_embeddings = embeddings[valid_indices].copy()
+    del embeddings
+    valid_gridpoints = gridpoints[valid_indices].copy()
+    del gridpoints
 
     print("normalize histograms 0..255 -> -1..1")
-    histograms = [normalize_histogram(h) for h in histograms]
-    histograms = np.array(histograms)
+    histograms_normalized = np.array(
+        list(
+            tqdm(
+                (normalize_histogram(h) for h in histograms[valid_indices]),
+                total=len(histograms[valid_indices]),
+            )
+        )
+    )
+    del histograms
 
-    # embeddings and histograms are now both (ROW_COUNT, n) - add the histograms
-    # to the end of the embeddings so we have (ROW_COUNT, n + 96)
-    # embeddings = np.concatenate((embeddings, histograms), axis=1)
-
-    # print("fit PCA")
-    # X_reduced = PCA(n_components=1024).fit_transform(embeddings)
-    # print(X_reduced.shape)
-
-    plot_ääripäät(embeddings, histograms, file_paths, gridpoints)
+    plot_ääripäät(valid_embeddings, histograms_normalized, file_paths, valid_gridpoints)
 
 
 def scale_to_0_1(arr: np.ndarray) -> np.ndarray:
@@ -268,26 +288,19 @@ def scale_to_0_1(arr: np.ndarray) -> np.ndarray:
 
 
 def plot_ääripäät(embeddings, histograms, paths, gridpoints):
-    # _, mahalanobis_distances = scorers.score_with_mahalanobis(embeddings)
-    embeddings = np.concatenate((embeddings, histograms), axis=1)
+    _, mahalanobis_distances = scorers.score_with_mahalanobis(embeddings)
+    concated = np.concatenate((embeddings, histograms), axis=1)
+    del embeddings
     del histograms
-    _, autoencoder_distances = scorers.score_with_autoencoder(embeddings)
+    _, autoencoder_distances = scorers.score_with_autoencoder(concated)
 
     # scale distances to 0..1
-    # mahalanobis_distances = scale_to_0_1(mahalanobis_distances)
+    mahalanobis_distances = scale_to_0_1(mahalanobis_distances)
     autoencoder_distances = scale_to_0_1(autoencoder_distances)
 
     # Sum the distances
-    # combined_distances = mahalanobis_distances + autoencoder_distances
-    indices_sorted = np.argsort(autoencoder_distances)
-
-    # print("save checkpoint")
-    # np.savez_compressed(
-    #     "./checkpoint.npz",
-    #     mahalanobis_distances=mahalanobis_distances,
-    #     autoencoder_distances=autoencoder_distances,
-    # )
-    # print("done checkpoint")
+    combined_distances = mahalanobis_distances + autoencoder_distances
+    indices_sorted = np.argsort(combined_distances)
 
     IMAGES_PER_GROUP_TO_SHOW = 300
 
