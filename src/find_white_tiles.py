@@ -40,16 +40,16 @@ def list_input_files(root_dir: str) -> list[str]:
 
 
 def read_image_to_tensor(path: str, device: Device = None):
-    ds = gdal.Open(path)
-    arr = ds.ReadAsArray(
-        xoff=0,
-        yoff=0,
-        xsize=ds.RasterXSize,
-        ysize=ds.RasterYSize,
-        buf_xsize=ds.RasterXSize,
-        buf_ysize=ds.RasterYSize,
-        buf_type=gdal.GDT_Byte,
-    )
+    with gdal.Open(path) as ds:
+        arr = ds.ReadAsArray(
+            xoff=0,
+            yoff=0,
+            xsize=ds.RasterXSize,
+            ysize=ds.RasterYSize,
+            buf_xsize=ds.RasterXSize,
+            buf_ysize=ds.RasterYSize,
+            buf_type=gdal.GDT_Byte,
+        )
 
     arr = torch.from_numpy(arr).contiguous()
     return tv_tensors.Image(arr, device=device)

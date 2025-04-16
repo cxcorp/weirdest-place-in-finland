@@ -58,10 +58,15 @@ def basename_no_ext(p: str) -> str:
 
 
 def read_image(path: str):
-    dataset = gdal.Open(path)
-    buf = dataset.ReadAsArray(
-        xoff=0, yoff=0, xsize=12000, ysize=12000, buf_xsize=244 * 12, buf_ysize=244 * 12
-    )
+    with gdal.Open(path) as ds:
+        buf = ds.ReadAsArray(
+            xoff=0,
+            yoff=0,
+            xsize=12000,
+            ysize=12000,
+            buf_xsize=244 * 12,
+            buf_ysize=244 * 12,
+        )
     buf = buf.transpose((1, 2, 0))  # (C, H, W) to (H, W, C)
     return cv2.cvtColor(buf, cv2.COLOR_RGB2BGR)
 
