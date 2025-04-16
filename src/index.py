@@ -34,15 +34,46 @@ def basename_no_ext(p: str) -> str:
     return os.path.splitext(os.path.basename(p))[0]
 
 
+def read_already_processed_file_paths(parquets_path: str) -> set[str]:
+    import pyarrow.dataset as ds
+    from tqdm import tqdm
+
+    dataset = ds.dataset(parquets_path, format="parquet")
+    rowcount: int = dataset.count_rows()
+
+    already_processed = set()
+
+    pbar = tqdm(total=rowcount, desc="Read parquet")
+    for batch in dataset.to_batches(columns=["file_path"]):
+        filenames: list[str] = batch["file_path"].to_pylist()
+        already_processed.update(filenames)
+        pbar.update(len(filenames))
+
+    pbar.close()
+
+    return already_processed
+
+
+run_id: int = 1
+parquest_path = ".\\parquets\\maxvit"
+
+
 def main():
     input_file_paths = list_input_files(IMAGE_DIR)
     assert len(input_file_paths) > 0
     print(f"Preparing to process {len(input_file_paths)} files")
 
-    conn = connect_to_db()
+    os.makedirs(parquest_path, exist_ok=True)
+    already_processed_file_paths = read_already_processed_file_paths(parquest_path)
+
+    input_file_paths = [
+        p for p in input_file_paths if p not in already_processed_file_paths
+    ]
+    print(f"-> {len(input_file_paths)} files after removing already processed")
+
+    # conn = connect_to_db()
 
     try:
-        run_id: int = 999
         # with conn, conn.cursor() as curs:
         #     curs.execute("SELECT DISTINCT tile_id FROM run_processed_files")
         #     processed_tile_names = set([r[0] for r in curs.fetchall()])
@@ -74,10 +105,15 @@ def main():
         #     )
         #     (run_id,) = curs.fetchone()
 
-        os.makedirs(".\\parquets\\maxvit", exist_ok=True)
         parquet_path = os.path.abspath(
-            os.path.join(".\\parquets\\maxvit", f"run-{run_id}.parquet")
+            os.path.join(parquest_path, f"run-{run_id}.parquet")
         )
+
+        if os.path.isfile(parquet_path):
+            print(
+                f"Warning: Parquet file {parquet_path} already exists. Refusing to overwrite."
+            )
+            return
 
         # input_file_paths = random.sample(input_file_paths, 10)
 
@@ -110,8 +146,8 @@ def main():
                         label,
                         histogram.flatten(),
                         embedding,
-                        point["x"],
-                        point["y"],
+                        point[0],
+                        point[1],
                     )
                     for label, batch in chunk
                     for point, embedding, histogram in batch
@@ -151,7 +187,8 @@ def main():
         #         (run_id,),
         #     )
     finally:
-        conn.close()
+        pass
+        # conn.close()
 
 
 if __name__ == "__main__":

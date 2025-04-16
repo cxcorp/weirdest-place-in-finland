@@ -1,26 +1,10 @@
-from collections.abc import Iterable
-import os
-import time
-import random
-
-import numpy as np
-import matplotlib.pyplot as plt
-import cv2
+# only import what we need here for get_multiple_rois_from_image
+# so multiprocessing pool doesn't explode the memory
 import numpy as np
 from osgeo import gdal
-import sys
-import pyarrow.dataset as ds
-from tqdm import tqdm, trange
-import torch
-import torchvision.models
-import pandas as pd
+from collections.abc import Iterable, Sequence
 
-from util.results_helpers import (
-    dump_run_results_to_parquet,
-    read_run_results_from_parquet,
-    connect_to_db,
-)
-
+gdal.UseExceptions()
 
 # Image.MAX_IMAGE_PIXELS = 12000 * 12000  # disable decompression bomb warning
 
@@ -35,7 +19,8 @@ TILE_SIZE = 224
 EMBEDDING_SIZE = 512
 
 PARQUETS_PATH = "./parquets/maxvit"
-RESULTS_PATH = "./results/maxvit-autoencoder"
+IGNORED_TILES_PATH = "./cutouts.txt"
+RESULTS_PATH = "./results/ALL-maxvit-hybrid-mahal plus autoencoder"
 
 
 def most_usual_and_usual_according_to_euclidean_dist(all_embeddings):
@@ -69,7 +54,8 @@ def normalize_histogram(h: list):
     total = h.sum()
     if total == 0:
         return h
-    return h / total
+    h = h / total  # Normalize to 0..1
+    return (h * 2) - 1  # Scale to -1..1 like the maxvit embeddings
 
 
 def chi_square_distance(h1, h2, eps=1e-10):
@@ -112,7 +98,11 @@ def get_multiple_rois_from_image(
 
         result[(grid_x, grid_y)] = roi
 
-    return result
+    return file_path, result
+
+
+def get_multiple_rois_from_image_mp(args: tuple[str, int, Iterable[tuple[int, int]]]):
+    return get_multiple_rois_from_image(*args)
 
 
 def get_image_roi(file_path: str, grid_x: str, grid_y: str, grid_size: int):
@@ -196,7 +186,39 @@ def read_from_parquet_dataset(parquets_path: str):
     return file_paths, histograms, embeddings, gridpoints
 
 
-def main2():
+class IgnoredTiles:
+    def __init__(self, ignored_tiles_file_path: str):
+        # for longer strides than 255, need to use a larger datatype below at convolutions
+        self.ignored = self._read_ignored_tiles_from_file(ignored_tiles_file_path)
+
+    def is_ignored(self, file_path: str, gridpoint: Sequence[int]):
+        x = gridpoint[0]
+        y = gridpoint[1]
+
+        if file_path not in self.ignored:
+            return False
+
+        return (x, y) in self.ignored[file_path]
+
+    def _read_ignored_tiles_from_file(
+        self,
+        ignore_file_path: str,
+    ) -> dict[str, set[tuple[int, int]]]:
+        ignored = dict()
+
+        with open(ignore_file_path, "r") as fp:
+            all_lines = fp.readlines()
+            all_lines = [l.strip() for l in all_lines if len(l.strip()) > 0]
+            for line in all_lines:
+                file_path, x_str, y_str = line.split(";")
+
+                ignored_tiles = ignored.setdefault(file_path, set())
+                ignored_tiles.add((int(x_str), int(y_str)))
+
+        return ignored
+
+
+def main():
     print("read")
     start_time = time.perf_counter()
     file_paths, histograms, embeddings, gridpoints = read_from_parquet_dataset(
@@ -205,16 +227,28 @@ def main2():
     end_time = time.perf_counter()
     print(f"read took {end_time - start_time:.2f} seconds")
 
-    print("filter away empty images")
-    valid_indices = [
-        i for i, h in enumerate(histograms) if not np.all(np.array(h) == 0)
-    ]
-    file_paths = [file_paths[i] for i in valid_indices]
-    histograms = [histograms[i] for i in valid_indices]
-    embeddings = np.array([embeddings[i] for i in valid_indices], dtype=np.float32)
-    gridpoints = [gridpoints[i] for i in valid_indices]
+    print("read ignored tiles")
+    ignored_tiles = IgnoredTiles("./cutouts.txt")
 
-    # print("normalize histograms")
+    print("filter away empty images")
+    valid_indices = np.array(
+        [
+            i
+            for i in range(len(file_paths))
+            if not ignored_tiles.is_ignored(file_paths[i], gridpoints[i])
+        ]
+    )
+    print(f"  valid:   {len(valid_indices)}")
+    print(
+        f"  invalid: {len(file_paths) - len(valid_indices)} ({((len(file_paths) - len(valid_indices)) / len(file_paths) * 100):.1f}%)"
+    )
+
+    file_paths = [file_paths[i] for i in valid_indices]
+    histograms = histograms[valid_indices]
+    embeddings = embeddings[valid_indices]
+    gridpoints = gridpoints[valid_indices]
+
+    print("normalize histograms 0..255 -> -1..1")
     histograms = [normalize_histogram(h) for h in histograms]
     histograms = np.array(histograms)
 
@@ -228,224 +262,37 @@ def main2():
 
     plot_ääripäät(embeddings, histograms, file_paths, gridpoints)
 
-    # print("import umap")
-    # import umap
-    # import umap.plot
-    # print("umap fitting")
-    # mapper = umap.UMAP(metric="cosine", n_neighbors=100).fit(embeddings)
 
-    # umap.plot.points(mapper)
-    # plt.show()
-
-
-def calculate_variables_for_mahal(vector):
-    mean = np.mean(vector, axis=0)
-
-    covariance = np.cov(vector, rowvar=False)
-    epsilon = 1e-6
-    covariance += np.eye(covariance.shape[0]) * epsilon
-    inv_covariance = np.linalg.inv(covariance)
-    diff = vector - mean
-    return inv_covariance, diff
+def scale_to_0_1(arr: np.ndarray) -> np.ndarray:
+    return (arr - arr.min()) / (arr.max() - arr.min())
 
 
 def plot_ääripäät(embeddings, histograms, paths, gridpoints):
-    # print("norm")
-    # embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
-
-    # calculate Mahalanobis distances
-    # embeddings = np.concatenate((embeddings, histograms), axis=1)
-    import sklearn.datasets
-    import sklearn.neighbors
-
+    # _, mahalanobis_distances = scorers.score_with_mahalanobis(embeddings)
     embeddings = np.concatenate((embeddings, histograms), axis=1)
+    del histograms
+    _, autoencoder_distances = scorers.score_with_autoencoder(embeddings)
 
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
-    from torch.utils.data import Dataset, DataLoader
+    # scale distances to 0..1
+    # mahalanobis_distances = scale_to_0_1(mahalanobis_distances)
+    autoencoder_distances = scale_to_0_1(autoencoder_distances)
 
-    class VectorDataset(Dataset):
-        def __init__(self, vectors):
-            self.data = torch.from_numpy(vectors.astype(np.float32))
+    # Sum the distances
+    # combined_distances = mahalanobis_distances + autoencoder_distances
+    indices_sorted = np.argsort(autoencoder_distances)
 
-        def __len__(self):
-            return len(self.data)
+    # print("save checkpoint")
+    # np.savez_compressed(
+    #     "./checkpoint.npz",
+    #     mahalanobis_distances=mahalanobis_distances,
+    #     autoencoder_distances=autoencoder_distances,
+    # )
+    # print("done checkpoint")
 
-        def __getitem__(self, idx):
-            # Autoencoder: the target is the input itself.
-            return self.data[idx]
+    IMAGES_PER_GROUP_TO_SHOW = 300
 
-    batch_size = 256
-    dataset = VectorDataset(embeddings)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-
-    class Autoencoder(nn.Module):
-        def __init__(self, input_dim=608, latent_dim=64):
-            """
-            input_dim : dimensionality of input data (608)
-            latent_dim: dimensionality of latent space
-            """
-            super(Autoencoder, self).__init__()
-            # Define the encoder network
-            self.encoder = nn.Sequential(
-                nn.Linear(input_dim, 256),
-                nn.ReLU(),
-                nn.Linear(256, latent_dim),
-            )
-            # Define the decoder network
-            self.decoder = nn.Sequential(
-                nn.Linear(latent_dim, 256),
-                nn.ReLU(),
-                nn.Linear(256, input_dim),
-                # Optionally: if your data is normalized, you might use a Sigmoid()
-                # activation to constrain outputs between 0 and 1.
-            )
-
-        def forward(self, x):
-            latent = self.encoder(x)
-            recon = self.decoder(latent)
-            return recon
-
-    latent_dim = 64  # or another value that makes sense
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = Autoencoder(input_dim=608, latent_dim=latent_dim)
-    model.to(device)
-
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
-
-    num_epochs = 50  # you can adjust the number of epochs
-    pbar = trange(num_epochs)
-    for epoch in pbar:
-        epoch_loss = 0.0
-        model.train()
-
-        for batch in dataloader:
-            batch = batch.to(device)
-            optimizer.zero_grad()
-
-            # Forward pass: get reconstruction
-            recon = model(batch)
-
-            # Compute reconstruction loss
-            loss = criterion(recon, batch)
-            loss.backward()
-            optimizer.step()
-
-            epoch_loss += loss.item() * batch.size(0)
-
-        epoch_loss /= len(dataset)
-        pbar.set_description(f"loss: {epoch_loss:.6f}")
-
-    # Switch model to evaluation mode
-    model.eval()
-    reconstruction_errors = []
-
-    del dataloader
-
-    # Calculate reconstruction errors for all embeddings
-    with torch.no_grad():
-        for batch in DataLoader(dataset, batch_size=batch_size, shuffle=False):
-            batch = batch.to(device)
-            recon = model(batch)
-            errors = torch.mean((recon - batch) ** 2, dim=1)  # MSE per sample
-            reconstruction_errors.extend(errors.cpu().numpy())
-
-    reconstruction_errors = np.array(reconstruction_errors)
-
-    # Sort indices based on reconstruction errors
-    indices_sorted = np.argsort(reconstruction_errors)
-
-    IMAGES_PER_GROUP_TO_SHOW = 200
     most_usual_indices = indices_sorted[:IMAGES_PER_GROUP_TO_SHOW]
-    most_unusual_indices = indices_sorted[-IMAGES_PER_GROUP_TO_SHOW:]
-
-    # embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
-
-    # rng = np.random.default_rng(seed=42)
-    # sample_indexes = rng.choice(embeddings.shape[0], 100_000, replace=False)
-    # embeddings = embeddings[sample_indexes]
-    # # histograms = histograms[sample_indexes]
-    # gridpoints = [gridpoints[i] for i in sample_indexes]
-    # paths = [paths[i] for i in sample_indexes]
-
-    #### los = sklearn.neighbors.LocalOutlierFactor(
-    ####     metric="minkowski", n_neighbors=75, contamination=0.001, n_jobs=31
-    #### ).fit(embeddings)
-
-    #### # los.negative_outlier_factor_ contains outlier scores: higher is more normal, lower is less normal
-    #### outlier_scores = los.negative_outlier_factor_
-    #### indices_sorted = np.argsort(outlier_scores)
-
-    #### IMAGES_PER_GROUP_TO_SHOW = 200
-    #### most_usual_indices = indices_sorted[:IMAGES_PER_GROUP_TO_SHOW]
-    #### most_unusual_indices = indices_sorted[-IMAGES_PER_GROUP_TO_SHOW:]
-
-    #### most_unusual_indices = sample_indexes[outlier_scores == -1]
-
-    # print("done")
-    # return
-
-    # em_inv_covariance, em_diff = calculate_variables_for_mahal(embeddings)
-    # # hist_inv_covariance, hist_diff = calculate_variables_for_mahal(histograms)
-
-    # batch_size = 100_000
-    # num_samples: int = embeddings.shape[0]
-    # embedding_mahal_distances = np.empty(num_samples, dtype=np.float32)
-    # # histogram_mahal_distances = np.empty(num_samples, dtype=np.float32)
-
-    # for start_idx in trange(0, num_samples, batch_size, desc="Calculating distances"):
-    #     end_idx = min(start_idx + batch_size, num_samples)
-    #     em_batch_diff = em_diff[start_idx:end_idx]
-    #     embedding_mahal_distances[start_idx:end_idx] = np.sqrt(
-    #         np.sum(em_batch_diff @ em_inv_covariance * em_batch_diff, axis=1)
-    #     )
-    #     # hist_batch_diff = hist_diff[start_idx:end_idx]
-    #     # histogram_mahal_distances[start_idx:end_idx] = np.sqrt(
-    #     #     np.sum(hist_batch_diff @ hist_inv_covariance * hist_batch_diff, axis=1)
-    #     # )
-    # distances = embedding_mahal_distances
-    # # now combine the two distances by averaging them
-    # # distances = (0.9 * embedding_mahal_distances) + (0.1 * histogram_mahal_distances)
-
-    # IMAGES_PER_GROUP_TO_SHOW = 200  # 5 * 7
-
-    # indices_sorted = np.argsort(distances)
-    # most_usual_indices = indices_sorted[:IMAGES_PER_GROUP_TO_SHOW]
-    # most_unusual_indices = indices_sorted[-IMAGES_PER_GROUP_TO_SHOW:]
-
-    # unusual_tensors = torch.from_numpy(embeddings[most_unusual_indices])
-    # with torch.no_grad():
-    #     model = torchvision.models.resnet50(
-    #         weights=torchvision.models.ResNet50_Weights.IMAGENET1K_V2
-    #     )
-    #     model.eval()
-    #     extractor = torch.nn.Sequential(list(model.children())[-1])
-
-    #     embeds = unusual_tensors[:, :-96]  # remove histogram
-
-    #     result = extractor(embeds)
-    #     predictions = result.softmax(dim=1)
-    #     class_ids = predictions.argmax(dim=1)
-
-    #     predictions_per_i = [
-    #         predictions[image_i, idx.item()].item()
-    #         for image_i, idx in enumerate(class_ids)
-    #     ]
-    #     labels_per_i = [
-    #         torchvision.models.ResNet50_Weights.IMAGENET1K_V2.meta["categories"][i]
-    #         for i in class_ids.tolist()
-    #     ]
-
-    # classifications = list(zip(labels_per_i, predictions_per_i))
-
-    # # free model
-    # del extractor
-    # del model
-
-    # # run torch.softmax on the most unusual embeddings (embeddings[most_unusual_indices])
-    # # to effectively get classifications
+    most_unusual_indices = indices_sorted[-IMAGES_PER_GROUP_TO_SHOW:][::-1]
 
     # read images en bulk with get_multiple_rois_from_image()
     image_path_to_rois = dict()
@@ -464,14 +311,22 @@ def plot_ääripäät(embeddings, histograms, paths, gridpoints):
 
     print("read images from disk")
     image_path_to_images = dict()
-    for filepath, rois in tqdm(image_path_to_rois.items(), desc="Reading images"):
-        image_path_to_images[filepath] = get_multiple_rois_from_image(
-            filepath, GRID_SIZE, rois
-        )
+    with Pool(8) as pool:
+        tasks = [
+            (file_path, GRID_SIZE, rois)
+            for file_path, rois in image_path_to_rois.items()
+        ]
+
+        for filepath, result in tqdm(
+            pool.imap_unordered(get_multiple_rois_from_image_mp, tasks, 8),
+            desc="Reading images",
+            total=len(tasks),
+        ):
+            image_path_to_images[filepath] = result
 
     def gather_images_from_indices(indices):
         output = []
-        for index_i, i in enumerate(indices):
+        for i in indices:
             grid_x, grid_y = gridpoints[i]
             filepath = paths[i]
             roi = image_path_to_images[filepath][(grid_x, grid_y)]
@@ -479,9 +334,7 @@ def plot_ääripäät(embeddings, histograms, paths, gridpoints):
             # label is basename without extension combined with grid coordinates
             label = os.path.splitext(os.path.basename(filepath))[0]
             label += f" ({grid_x}, {grid_y})"
-            # label += (
-            #     f" ({classifications[index_i][0]}, {classifications[index_i][1]:.2f})"
-            # )
+
             output.append((label, roi))
         return output
 
@@ -504,38 +357,21 @@ def plot_ääripäät(embeddings, histograms, paths, gridpoints):
         )
 
 
-def plot_all(images, title, ncols=4):
-    for i, (path, img) in enumerate(images):
-        plt.subplot(
-            len(images) // ncols + (1 if len(images) % ncols != 0 else 0), ncols, i + 1
-        )
-        plt.imshow(img)
-        plt.axis("off")
-        plt.title(os.path.basename(path), fontsize=8)
-
-    plt.tight_layout(pad=0.2)
-    plt.suptitle(title)
-
-
-def real_main():
-    if len(sys.argv) <= 1:
-        print("No command provided. Use 'plot' or 'parquet <id>'.")
-        return 1
-
-    command = sys.argv[1]
-    if command == "plot":
-        main2()
-        return 0
-
-    if command == "parquet" and len(sys.argv) > 2:
-        run_id = int(sys.argv[2])
-        dump_to_parquet(run_id)
-        return 0
-
-    print("Unknown command. Use 'plot' or 'parquet <id>'.")
-    return 1
-
-
 if __name__ == "__main__":
-    main2()
-    # sys.exit(real_main())
+    import os
+    import time
+    from multiprocessing import Pool
+
+    import cv2
+    import pyarrow.dataset as ds
+    from tqdm import tqdm
+
+    from util.results_helpers import (
+        dump_run_results_to_parquet,
+        read_run_results_from_parquet,
+        connect_to_db,
+    )
+
+    import util.scorers as scorers
+
+    main()

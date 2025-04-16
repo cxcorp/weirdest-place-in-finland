@@ -1,21 +1,19 @@
-import itertools
 import os
 from typing import List, Generator
 
-from tqdm import tqdm, trange
+from tqdm import tqdm
 import torch
 from torch import nn
 from torch.types import Device, Tensor
 from torchvision import models, tv_tensors
 from torchvision.transforms import v2
 from torchvision.models import feature_extraction
-import numpy as np
-from PIL import Image
-from multiprocessing import Pool
 from osgeo import gdal
+import numpy as np
 
 
 from util.io_utils import find_all_files_with_extension_recursively
+from util.no_data_filter import NoDataFilter
 
 
 FILE_READER_NAME = "file_reader"
@@ -84,17 +82,6 @@ transforms = v2.Compose(
 )
 
 
-def read_images(paths: str):
-    # tensor of shape (B, C, H, W, dtype=torch.uint8)
-    print("Read images")
-    output_tensor = torch.empty((len(paths), 3, 224, 224), dtype=torch.uint8)
-    for i, path in enumerate(paths):
-        image = Image.open(path)
-        image = v2.ToImage()(image)
-        output_tensor[i] = image
-    return output_tensor
-
-
 def read_image(path: str, device: Device = None):
     ds = gdal.Open(path)
     arr = ds.ReadAsArray(
@@ -129,21 +116,39 @@ def run_pipeline(input_file_paths: List[str], batch_size_resnet: int = 12 * 12):
         (read_image(path, resnet_device), path) for path in input_file_paths
     )
 
+    has_nodata = NoDataFilter(threshold=48)
+
     pbar = tqdm(total=len(input_file_paths))
     for image, path in images_iterator:
 
         pbar.set_description("Datamangel")
         # image is a tensor of the full 2688x2688 image in CHW format
-        # send it to GPU and efficiently split to 12*12 tiles of size 224x224
+        # efficiently split it to 12*12 tiles of size 224x224
         batch = image.unfold(1, 224, 224).unfold(2, 224, 224)  # (3, 12, 12, 224, 224)
         batch = batch.permute(1, 2, 0, 3, 4).reshape(
             -1, 3, 224, 224
         )  # (144, 3, 224, 224)
 
-        batch_size = batch.shape[0]
+        # (x,y)[]
+        grid_points = np.array([(i % 12, i // 12) for i in range(batch.shape[0])])
+
+        # run nodata detection
+        nodata_batch = batch.cpu().numpy()  # copy to cpu
+        # (B, C, H, W) -> (B, H, W, C) for nodata filter
+        nodata_batch = nodata_batch.transpose(0, 2, 3, 1)
+
+        tile_is_nodata = np.array([has_nodata(img) for img in nodata_batch], dtype=bool)
+        valid_indices = np.where(~tile_is_nodata)[0]
+
+        if valid_indices.shape[0] == 0:
+            tqdm.write(f"No valid tiles in {path}")
+            # no tile from this image was valid
+            pbar.update(1)
+            continue
 
         # calculate all embeddings for this batch
         with torch.no_grad():
+            batch = batch.to("cuda")[valid_indices]  # skip filtered tiles
             histograms = calculate_histograms(batch)
             # resnet presets transforms: to normalized floats
             batch = transforms(batch)
@@ -151,10 +156,9 @@ def run_pipeline(input_file_paths: List[str], batch_size_resnet: int = 12 * 12):
 
         histograms = histograms.cpu().numpy()
         # (BATCH_SIZE, 512, 1, 1) -> (BATCH_SIZE, 512)
-        #all_embeddings = np.squeeze(embeddings.cpu().numpy(), axis=(2, 3))
+        # all_embeddings = np.squeeze(embeddings.cpu().numpy(), axis=(2, 3))
         all_embeddings = embeddings.cpu().numpy()
-        assert all_embeddings.shape == (batch_size, 512)
-        grid_points = [({"x": i % 12, "y": i // 12}) for i in range(batch_size)]
+        grid_points = grid_points[valid_indices]
 
         pbar.set_description("Database")
         yield path, list(zip(grid_points, all_embeddings, histograms))
