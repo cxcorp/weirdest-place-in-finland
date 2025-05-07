@@ -4,6 +4,18 @@ Runs MaxViT-T to produce embeddings of images, scores the images according to ho
 
 TODO rest of the readme
 
+## Results
+
+Download `results-jpeg.zip` and look at the files.
+
+The folders have no proper naming convention, but it's something like this:
+
+```
+<maxvit|resnet>-<scoring mechanism>-<scoring mechanism details>
+```
+
+If prefixed by `ALL-`, it contains results from the FULL dataset. If not, it's from some sample of 1000-4000 images.
+
 ## Running
 
 1. Run https://github.com/cxcorp/mml-orto-downloader-py to download image dataset
