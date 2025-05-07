@@ -83,8 +83,6 @@ def main():
 
     # os.makedirs("./cutouts", exist_ok=True)
 
-    has_nodata = NoDataFilter(threshold=48)
-
     with open("./cutouts.txt", "w") as fp, Pool(12) as pool:
         for result in tqdm(
             pool.imap_unordered(get_nodata_array, all_images, chunksize=8),
@@ -96,10 +94,6 @@ def main():
             imagepath, coords = result
             for x, y in coords:
                 fp.write(f"{imagepath};{x};{y}\n")
-    #     ax.axis("off")  # Hide axes for cleaner visualization
-
-    # plt.tight_layout()
-    # plt.show()
 
 
 if __name__ == "__main__":

@@ -1,9 +1,8 @@
 import math
-import os
 import sys
 
 import numpy as np
-from tqdm import trange
+from tqdm import trange, tqdm
 
 
 def score_with_LocalOutlierFactor(embeddings):
@@ -24,7 +23,8 @@ def score_with_autoencoder(embeddings):
     import torch
     import torch.nn as nn
     import torch.optim as optim
-    from torch.utils.data import Dataset, DataLoader, random_split
+    from torch.utils.data import Dataset, DataLoader
+    from uniplot import plot_gen
 
     class VectorDataset(Dataset):
         def __init__(self, vectors):
@@ -36,38 +36,33 @@ def score_with_autoencoder(embeddings):
             return len(self.data)
 
         def __getitem__(self, idx):
-            # Autoencoder: the target is the input itself.
             return self.data[idx]
 
     full_dataset = VectorDataset(embeddings)
     del embeddings
-    train_frac = 0.3
-    train_size = int(train_frac * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    train_ds, val_ds = random_split(full_dataset, [train_size, val_size])
-
-    batch_size = 256
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    batch_size = 2048
+    loader = DataLoader(full_dataset, batch_size=batch_size, shuffle=True)
 
     class Autoencoder(nn.Module):
-        def __init__(self, input_dim=608, latent_dim=64):
+        def __init__(self, input_dim: int, latent_dim: int):
             """
-            input_dim : dimensionality of input data (608)
+            input_dim : dimensionality of input data
             latent_dim: dimensionality of latent space
             """
             super(Autoencoder, self).__init__()
-            # Define the encoder network
             self.encoder = nn.Sequential(
-                nn.Linear(input_dim, 256),
-                nn.ReLU(),
-                nn.Linear(256, latent_dim),
+                nn.Linear(input_dim, 512),
+                nn.LeakyReLU(inplace=True),
+                nn.Linear(512, 384),
+                nn.LeakyReLU(inplace=True),
+                nn.Linear(384, latent_dim),
             )
-            # Define the decoder network
             self.decoder = nn.Sequential(
-                nn.Linear(latent_dim, 256),
-                nn.ReLU(),
-                nn.Linear(256, input_dim),
+                nn.Linear(latent_dim, 384),
+                nn.LeakyReLU(inplace=True),
+                nn.Linear(384, 512),
+                nn.LeakyReLU(inplace=True),
+                nn.Linear(512, input_dim),
                 nn.Tanh(),
             )
 
@@ -76,44 +71,51 @@ def score_with_autoencoder(embeddings):
             recon = self.decoder(latent)
             return recon
 
-    latent_dim = 64
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = Autoencoder(input_dim=608, latent_dim=latent_dim)
+    model = Autoencoder(
+        input_dim=608,
+        # input_dim=512,
+        latent_dim=256,
+    )
     model.to(device)
 
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    num_epochs = 50
 
-    checkpoint_path = "autoencoder_maxvit_checkpoint.pth"
+    criterion = nn.MSELoss()
+    # optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = optim.AdamW(model.parameters(), weight_decay=0, lr=1e-3)
+
+    checkpoint_path = "autoencoder_maxvit_checkpoint_fullds_adamw_lr3e-3_wd0.05_4096b_THREELAYER_nohist_ex.pth"
     best_loss = float("inf")
     model_loaded = False
 
     # Load checkpoint if it exists
-    if os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        best_loss = checkpoint["best_loss"]
-        model_loaded = True
-        print(f"Loaded checkpoint with best loss: {best_loss:.6f}")
+    # if os.path.exists(checkpoint_path):
+    #     checkpoint = torch.load(checkpoint_path, map_location=device)
+    #     model.load_state_dict(checkpoint["model_state_dict"])
+    #     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    #     best_loss = checkpoint["best_loss"]
+    #     model_loaded = True
+    #     print(f"Loaded checkpoint with best loss: {best_loss:.6f}")
 
     # Skip training if model is loaded
     if not model_loaded:
-        num_epochs = 50
+        plot_xs = []
+        plot_ys = []
+        plt = plot_gen(width=100, lines=True, color=True, character_set="braille")
+
         pbar = trange(num_epochs)
         for epoch in pbar:
-            # TRAIN PHASE
+            # TRAIN
             model.train()
             train_loss = 0.0
 
-            for batch in train_loader:
+            for batch in loader:
                 batch = batch.to(device)
                 optimizer.zero_grad()
 
-                # Forward pass: get reconstruction
                 recon = model(batch)
 
-                # Compute reconstruction loss
                 loss = criterion(recon, batch)
                 loss.backward()
                 optimizer.step()
@@ -128,27 +130,16 @@ def score_with_autoencoder(embeddings):
                     print("batch.size(0)", batch.size(0))
                     sys.exit(1)
 
-            train_loss /= len(train_ds)
+            train_loss /= len(full_dataset)
             if not math.isfinite(train_loss):
                 print("NAN LOSS")
                 print("epoch_loss", train_loss)
-                print("len(train_loader)", len(train_ds))
+                print("len(full_dataset)", len(full_dataset))
                 print("loss.item()", loss.item())
                 print("batch.size(0)", batch.size(0))
                 sys.exit(1)
 
-            # VALIDATE PHASE
-            model.eval()
-
-            val_loss = 0.0
-            with torch.no_grad():
-                for batch in val_loader:
-                    batch = batch.to(device)
-                    recon = model(batch)
-                    val_loss += criterion(recon, batch).item() * batch.size(0)
-            val_loss /= len(val_ds)
-
-            pbar.set_description(f"tloss: {train_loss:.6f}, vloss: {val_loss:.6f}")
+            pbar.set_description(f"tloss: {train_loss:.6f}")
 
             # Save checkpoint if this is the best loss so far
             if train_loss < best_loss:
@@ -163,17 +154,24 @@ def score_with_autoencoder(embeddings):
                 )
                 print(f"Checkpoint saved with best loss: {best_loss:.6f}")
 
-    # Switch model to evaluation mode
+            plot_xs.append(epoch)
+            plot_ys.append(train_loss)
+            print("")
+            plt.update(xs=plot_xs, ys=plot_ys, title="Loss")
+
     model.eval()
     reconstruction_errors = []
 
     # Calculate reconstruction errors for all embeddings
     with torch.no_grad():
+        pbar = tqdm(total=len(full_dataset), desc="Autoencoder scoring")
         for batch in DataLoader(full_dataset, batch_size=batch_size, shuffle=False):
             batch = batch.to(device)
             recon = model(batch)
             errors = torch.mean((recon - batch) ** 2, dim=1)  # MSE per sample
             reconstruction_errors.extend(errors.cpu().numpy())
+            pbar.update(batch.shape[0])
+        pbar.close()
 
     reconstruction_errors = np.array(reconstruction_errors)
 

@@ -1,5 +1,15 @@
 .venv
 __pycache__
+
 filelist.txt
 /results/
 /parquets/
+/cutouts/
+
+*.pth
+*.parquet
+cutouts.txt
+
+info.txt
+info_orig.txt
+*.ipynb

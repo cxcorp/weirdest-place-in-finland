@@ -6,8 +6,6 @@ from collections.abc import Iterable, Sequence
 
 gdal.UseExceptions()
 
-# Image.MAX_IMAGE_PIXELS = 12000 * 12000  # disable decompression bomb warning
-
 BATCH_SIZE_RESIZE = 4
 # batch entire image at a time, we seem to have the VRAM for it
 BATCH_SIZE_RESNET = 144
@@ -20,7 +18,8 @@ EMBEDDING_SIZE = 512
 
 PARQUETS_PATH = "./parquets/maxvit"
 IGNORED_TILES_PATH = "./cutouts.txt"
-RESULTS_PATH = "./results/ALL-maxvit-hybrid-mahal plus autoencoder"
+# RESULTS_PATH = "./results/ALL-maxvit-autoencoder full ds adamw_lr3e-3_wd0.05_4096b THREELAYER nohist ex veryleaky scaled"
+RESULTS_PATH = "./results/ALL-maxvit pyod LUNAR full ds"
 
 
 def most_usual_and_usual_according_to_euclidean_dist(all_embeddings):
