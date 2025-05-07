@@ -6,7 +6,7 @@ TODO rest of the readme
 
 ## Running
 
-1. Run `https://github.com/cxcorp/mml-orto-downloader-py` to download image dataset
+1. Run https://github.com/cxcorp/mml-orto-downloader-py to download image dataset
 2. ctrl+f `\images\` from the repoes to change the file path where they're downloaded, and where this repo expects to find them, sorry
 3. figure out what dependencies the repo needs
   - `Dockerfile` has at least some of the most essentials but there are lots more, sorry!!!
